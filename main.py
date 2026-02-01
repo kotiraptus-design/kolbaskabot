@@ -97,6 +97,13 @@ def add_recipient(chat_id: int):
     conn.commit()
     conn.close()
 
+def remove_recipient(chat_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('DELETE FROM recipients WHERE chat_id = ?', (chat_id,))
+    conn.commit()
+    conn.close()
+
 def list_recipients() -> List[int]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -104,6 +111,14 @@ def list_recipients() -> List[int]:
     rows = cur.fetchall()
     conn.close()
     return [r[0] for r in rows]
+
+def is_recipient(chat_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('SELECT 1 FROM recipients WHERE chat_id = ?', (chat_id,))
+    result = cur.fetchone() is not None
+    conn.close()
+    return result
 
 def insert_duties(records: List[Dict]):
     conn = sqlite3.connect(DB_PATH)
@@ -154,6 +169,7 @@ def parse_csv(content: bytes) -> List[Dict]:
                 name = row[name_col].strip()
                 
                 try:
+                    # Убираем смену месяца - просто парсим дату как есть
                     if '-' in date_str:
                         d = datetime.strptime(date_str, '%Y-%m-%d').date()
                     elif '.' in date_str:
@@ -161,13 +177,15 @@ def parse_csv(content: bytes) -> List[Dict]:
                     elif '/' in date_str:
                         d = datetime.strptime(date_str, '%d/%m/%Y').date()
                     elif date_str.isdigit():
+                        # Если только число дня, используем текущий год и месяц
                         today = datetime.now(TIMEZONE).date()
                         d = date(today.year, today.month, int(date_str))
                     else:
                         continue
                     
                     records.append({'date': d.isoformat(), 'name': name})
-                except:
+                except Exception as e:
+                    logger.error(f"Ошибка парсинга даты '{date_str}': {e}")
                     continue
         
         logger.info(f"Парсинг CSV: найдено {len(records)} записей")
@@ -185,9 +203,9 @@ async def send_today_message():
         names = get_duties_for_date(today)
         
         if not names:
-            text = f'📅 На {today.isoformat()} дежурных не найдено.'
+            text = f'📅 На {today.strftime("%d.%m.%Y")} дежурных не найдено.'
         else:
-            text = f'📅 Дежурные на {today.isoformat()}:\n' + '\n'.join(f'• {n}' for n in names)
+            text = f'📅 Дежурные на {today.strftime("%d.%m.%Y")}:\n' + '\n'.join(f'• {n}' for n in names)
         
         recipients = list_recipients()
         if not recipients:
@@ -220,19 +238,78 @@ def schedule_daily(send_time: str):
 # ========== КОМАНДЫ БОТА ==========
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    keyboard = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="📝 Подписаться на рассылку")],
+            [types.KeyboardButton(text="❌ Отписаться от рассылки")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    
     if message.from_user.id in ADMIN_IDS:
         await message.reply(
             "👑 <b>Бот для рассылки дежурных</b>\n\n"
             "<b>Команды:</b>\n"
             "• /send_today - Отправить дежурных\n"
-            "• /set_time HH:MM - Установить время\n\n"
+            "• /set_time HH:MM - Установить время\n"
+            "• /subscribers - Показать подписчиков\n\n"
             "<b>Загрузка данных:</b>\n"
             "Отправьте CSV файл с колонками:\n"
             "- Дата (ДД.ММ.ГГГГ или ГГГГ-ММ-ДД)\n"
-            "- Имя (ФИО дежурного)"
+            "- Имя (ФИО дежурного)\n\n"
+            "<b>Используйте кнопки ниже для управления подпиской</b>",
+            reply_markup=keyboard
         )
     else:
-        await message.reply("🍅 помидор")
+        await message.reply(
+            "🤖 <b>Бот рассылки дежурных</b>\n\n"
+            "Используйте кнопки ниже, чтобы подписаться или отписаться от ежедневной рассылки дежурных.",
+            reply_markup=keyboard
+        )
+
+@dp.message(F.text == "📝 Подписаться на рассылку")
+async def cmd_subscribe(message: types.Message):
+    chat_id = message.chat.id
+    
+    if is_recipient(chat_id):
+        await message.reply("✅ Вы уже подписаны на рассылку!")
+        return
+    
+    add_recipient(chat_id)
+    await message.reply(
+        "✅ Вы успешно подписались на рассылку!\n\n"
+        f"Ежедневно в {get_config('send_time') or DEFAULT_SEND_TIME} вы будете получать список дежурных на текущий день."
+    )
+
+@dp.message(F.text == "❌ Отписаться от рассылки")
+async def cmd_unsubscribe(message: types.Message):
+    chat_id = message.chat.id
+    
+    if not is_recipient(chat_id):
+        await message.reply("ℹ️ Вы не были подписаны на рассылку.")
+        return
+    
+    remove_recipient(chat_id)
+    await message.reply("❌ Вы отписались от рассылки дежурных.")
+
+@dp.message(Command("subscribers"))
+async def cmd_subscribers(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("❌ Только для администраторов")
+        return
+    
+    recipients = list_recipients()
+    
+    if not recipients:
+        await message.reply("📭 Нет подписчиков на рассылку.")
+        return
+    
+    text = f"📋 <b>Список подписчиков ({len(recipients)}):</b>\n\n"
+    for chat_id in recipients:
+        text += f"• ID: {chat_id}\n"
+    
+    await message.reply(text)
 
 @dp.message(Command("send_today"))
 async def cmd_send_today(message: types.Message):
@@ -303,7 +380,12 @@ async def handle_docs(message: types.Message):
         
         insert_duties(records)
         
-        await message.reply(f'✅ Импортировано {len(records)} записей\n\nИспользуйте /send_today для проверки')
+        # Показываем пример данных
+        sample = "\n".join([f"{r['date']}: {r['name']}" for r in records[:5]])
+        if len(records) > 5:
+            sample += f"\n... и еще {len(records) - 5} записей"
+        
+        await message.reply(f'✅ Импортировано {len(records)} записей\n\nПример:\n{sample}\n\nИспользуйте /send_today для проверки')
         
     except Exception as e:
         logger.error(f"Ошибка обработки файла: {e}")
@@ -416,7 +498,6 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     
     logger.info(f"🚀 Сервер запущен на порту {port}")
-    logger.info(f"🌐 URL: https://ваш-сервис.onrender.com")
     
     # Бесконечный запуск
     await site.start()
