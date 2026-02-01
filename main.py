@@ -136,6 +136,21 @@ def get_duties_for_date(d: date) -> List[str]:
     conn.close()
     return [r[0] for r in rows]
 
+def get_all_duties() -> List[Dict]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('SELECT duty_date, name FROM duties ORDER BY duty_date')
+    rows = cur.fetchall()
+    conn.close()
+    return [{'date': r[0], 'name': r[1]} for r in rows]
+
+def clear_all_duties():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('DELETE FROM duties')
+    conn.commit()
+    conn.close()
+
 # ========== ПАРСЕР CSV ==========
 def parse_csv(content: bytes) -> List[Dict]:
     """Парсит CSV файлы"""
@@ -169,17 +184,13 @@ def parse_csv(content: bytes) -> List[Dict]:
                 name = row[name_col].strip()
                 
                 try:
-                    # Убираем смену месяца - просто парсим дату как есть
+                    # Просто парсим дату как есть
                     if '-' in date_str:
                         d = datetime.strptime(date_str, '%Y-%m-%d').date()
                     elif '.' in date_str:
                         d = datetime.strptime(date_str, '%d.%m.%Y').date()
                     elif '/' in date_str:
                         d = datetime.strptime(date_str, '%d/%m/%Y').date()
-                    elif date_str.isdigit():
-                        # Если только число дня, используем текущий год и месяц
-                        today = datetime.now(TIMEZONE).date()
-                        d = date(today.year, today.month, int(date_str))
                     else:
                         continue
                     
@@ -235,95 +246,191 @@ def schedule_daily(send_time: str):
     logger.info(f'Рассылка запланирована на {send_time}')
     set_config('send_time', send_time)
 
+# ========== СОЗДАНИЕ МЕНЮ КНОПОК ==========
+def get_admin_menu():
+    """Возвращает меню кнопок для администраторов"""
+    buttons = [
+        [types.KeyboardButton(text="📝 Подписаться на рассылку")],
+        [types.KeyboardButton(text="❌ Отписаться от рассылки")],
+        [types.KeyboardButton(text="📅 Дежурные сегодня")],
+        [types.KeyboardButton(text="📋 Все дежурные")],
+        [types.KeyboardButton(text="⚙️ Установить время")],
+        [types.KeyboardButton(text="👥 Показать подписчиков")],
+        [types.KeyboardButton(text="📤 Отправить сейчас")]
+    ]
+    
+    return types.ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True
+    )
+
 # ========== КОМАНДЫ БОТА ==========
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    keyboard = types.ReplyKeyboardMarkup(
-        keyboard=[
-            [types.KeyboardButton(text="📝 Подписаться на рассылку")],
-            [types.KeyboardButton(text="❌ Отписаться от рассылки")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
+    is_admin = message.from_user.id in ADMIN_IDS
     
-    if message.from_user.id in ADMIN_IDS:
+    if is_admin:
+        menu = get_admin_menu()
         await message.reply(
             "👑 <b>Бот для рассылки дежурных</b>\n\n"
-            "<b>Команды:</b>\n"
-            "• /send_today - Отправить дежурных\n"
-            "• /set_time HH:MM - Установить время\n"
-            "• /subscribers - Показать подписчиков\n\n"
-            "<b>Загрузка данных:</b>\n"
-            "Отправьте CSV файл с колонками:\n"
+            "<b>Доступные функции:</b>\n"
+            "• Подписаться/отписаться от рассылки\n"
+            "• Посмотреть дежурных сегодня\n"
+            "• Посмотреть всех дежурных\n"
+            "• Установить время рассылки\n"
+            "• Показать список подписчиков\n"
+            "• Отправить рассылку сейчас\n\n"
+            "<b>Для загрузки данных отправьте CSV файл с колонками:</b>\n"
             "- Дата (ДД.ММ.ГГГГ или ГГГГ-ММ-ДД)\n"
-            "- Имя (ФИО дежурного)\n\n"
-            "<b>Используйте кнопки ниже для управления подпиской</b>",
-            reply_markup=keyboard
+            "- Имя (ФИО дежурного)",
+            reply_markup=menu
         )
     else:
-        await message.reply(
-            "🤖 <b>Бот рассылки дежурных</b>\n\n"
-            "Используйте кнопки ниже, чтобы подписаться или отписаться от ежедневной рассылки дежурных.",
-            reply_markup=keyboard
-        )
+        await message.reply("помидор")
 
 @dp.message(F.text == "📝 Подписаться на рассылку")
 async def cmd_subscribe(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("помидор")
+        return
+    
     chat_id = message.chat.id
     
     if is_recipient(chat_id):
-        await message.reply("✅ Вы уже подписаны на рассылку!")
+        await message.reply("✅ Вы уже подписаны на рассылку!", reply_markup=get_admin_menu())
         return
     
     add_recipient(chat_id)
+    send_time = get_config('send_time') or DEFAULT_SEND_TIME
     await message.reply(
-        "✅ Вы успешно подписались на рассылку!\n\n"
-        f"Ежедневно в {get_config('send_time') or DEFAULT_SEND_TIME} вы будете получать список дежурных на текущий день."
+        f"✅ Вы успешно подписались на рассылку!\n\n"
+        f"Ежедневно в {send_time} вы будете получать список дежурных на текущий день.",
+        reply_markup=get_admin_menu()
     )
 
 @dp.message(F.text == "❌ Отписаться от рассылки")
 async def cmd_unsubscribe(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("помидор")
+        return
+    
     chat_id = message.chat.id
     
     if not is_recipient(chat_id):
-        await message.reply("ℹ️ Вы не были подписаны на рассылку.")
+        await message.reply("ℹ️ Вы не были подписаны на рассылку.", reply_markup=get_admin_menu())
         return
     
     remove_recipient(chat_id)
-    await message.reply("❌ Вы отписались от рассылки дежурных.")
+    await message.reply(
+        "❌ Вы отписались от рассылки дежурных.",
+        reply_markup=get_admin_menu()
+    )
 
-@dp.message(Command("subscribers"))
-async def cmd_subscribers(message: types.Message):
+@dp.message(F.text == "📅 Дежурные сегодня")
+async def cmd_duty_today(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
-        await message.reply("❌ Только для администраторов")
+        await message.reply("помидор")
+        return
+    
+    today = datetime.now(TIMEZONE).date()
+    names = get_duties_for_date(today)
+    
+    if not names:
+        text = f'📅 На {today.strftime("%d.%m.%Y")} дежурных не найдено.'
+    else:
+        text = f'📅 Дежурные на {today.strftime("%d.%m.%Y")}:\n' + '\n'.join(f'• {n}' for n in names)
+    
+    await message.reply(text, reply_markup=get_admin_menu())
+
+@dp.message(F.text == "📋 Все дежурные")
+async def cmd_all_duties(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("помидор")
+        return
+    
+    duties = get_all_duties()
+    
+    if not duties:
+        await message.reply("📭 В базе данных нет записей о дежурных.", reply_markup=get_admin_menu())
+        return
+    
+    # Группируем по дате
+    duties_by_date = {}
+    for duty in duties:
+        date_str = duty['date']
+        duties_by_date.setdefault(date_str, []).append(duty['name'])
+    
+    text = "📋 <b>Все дежурные:</b>\n\n"
+    for date_str in sorted(duties_by_date.keys()):
+        duty_date = datetime.fromisoformat(date_str).date()
+        names = duties_by_date[date_str]
+        text += f"<b>{duty_date.strftime('%d.%m.%Y')}:</b>\n"
+        text += '\n'.join(f'• {n}' for n in names) + "\n\n"
+    
+    # Если текст слишком длинный, разбиваем на части
+    if len(text) > 4000:
+        parts = []
+        current_part = ""
+        for line in text.split('\n'):
+            if len(current_part) + len(line) + 1 < 4000:
+                current_part += line + "\n"
+            else:
+                parts.append(current_part)
+                current_part = line + "\n"
+        if current_part:
+            parts.append(current_part)
+        
+        for part in parts:
+            await message.reply(part)
+    else:
+        await message.reply(text, reply_markup=get_admin_menu())
+
+@dp.message(F.text == "⚙️ Установить время")
+async def cmd_set_time_menu(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("помидор")
+        return
+    
+    current_time = get_config('send_time') or DEFAULT_SEND_TIME
+    await message.reply(
+        f"⏰ Текущее время рассылки: <b>{current_time}</b>\n\n"
+        "Для установки нового времени используйте команду:\n"
+        "<code>/set_time HH:MM</code>\n\n"
+        "Пример: <code>/set_time 09:00</code>",
+        reply_markup=get_admin_menu()
+    )
+
+@dp.message(F.text == "👥 Показать подписчиков")
+async def cmd_subscribers_menu(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("помидор")
         return
     
     recipients = list_recipients()
     
     if not recipients:
-        await message.reply("📭 Нет подписчиков на рассылку.")
+        await message.reply("📭 Нет подписчиков на рассылку.", reply_markup=get_admin_menu())
         return
     
     text = f"📋 <b>Список подписчиков ({len(recipients)}):</b>\n\n"
     for chat_id in recipients:
         text += f"• ID: {chat_id}\n"
     
-    await message.reply(text)
+    await message.reply(text, reply_markup=get_admin_menu())
 
-@dp.message(Command("send_today"))
-async def cmd_send_today(message: types.Message):
+@dp.message(F.text == "📤 Отправить сейчас")
+async def cmd_send_now(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
-        await message.reply("❌ Только для администраторов")
+        await message.reply("помидор")
         return
     
     count = await send_today_message()
-    await message.reply(f'✅ Рассылка отправлена {count} получателям')
+    await message.reply(f'✅ Рассылка отправлена {count} получателям', reply_markup=get_admin_menu())
 
 @dp.message(Command("set_time"))
 async def cmd_set_time(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
-        await message.reply("❌ Только для администраторов")
+        await message.reply("помидор")
         return
     
     parts = message.text.split()
@@ -337,21 +444,76 @@ async def cmd_set_time(message: types.Message):
         if not (0 <= hh < 24 and 0 <= mm < 60):
             raise ValueError
         schedule_daily(t)
-        await message.reply(f'✅ Время рассылки установлено: {t}')
+        await message.reply(f'✅ Время рассылки установлено: {t}', reply_markup=get_admin_menu())
     except:
-        await message.reply('❌ Неверный формат времени\nИспользуйте: HH:MM (например 09:00)')
+        await message.reply('❌ Неверный формат времени\nИспользуйте: HH:MM (например 09:00)', reply_markup=get_admin_menu())
+
+@dp.message(Command("clear_duties"))
+async def cmd_clear_duties(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("помидор")
+        return
+    
+    clear_all_duties()
+    await message.reply('✅ Все записи о дежурных удалены.', reply_markup=get_admin_menu())
+
+@dp.message(Command("subscribers"))
+async def cmd_subscribers_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("помидор")
+        return
+    
+    recipients = list_recipients()
+    
+    if not recipients:
+        await message.reply("📭 Нет подписчиков на рассылку.", reply_markup=get_admin_menu())
+        return
+    
+    text = f"📋 <b>Список подписчиков ({len(recipients)}):</b>\n\n"
+    for chat_id in recipients:
+        text += f"• ID: {chat_id}\n"
+    
+    await message.reply(text, reply_markup=get_admin_menu())
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("помидор")
+        return
+    
+    help_text = (
+        "👑 <b>Команды для администраторов:</b>\n\n"
+        "<b>Кнопки меню:</b>\n"
+        "• 📝 Подписаться на рассылку - подписаться\n"
+        "• ❌ Отписаться от рассылки - отписаться\n"
+        "• 📅 Дежурные сегодня - показать дежурных на сегодня\n"
+        "• 📋 Все дежурные - показать все записи\n"
+        "• ⚙️ Установить время - изменить время рассылки\n"
+        "• 👥 Показать подписчиков - список подписчиков\n"
+        "• 📤 Отправить сейчас - отправить рассылку немедленно\n\n"
+        "<b>Текстовые команды:</b>\n"
+        "• /set_time HH:MM - установить время рассылки\n"
+        "• /clear_duties - очистить все записи о дежурных\n"
+        "• /subscribers - показать подписчиков\n\n"
+        "<b>Загрузка данных:</b>\n"
+        "Отправьте CSV файл с колонками:\n"
+        "- Дата (ДД.ММ.ГГГГ или ГГГГ-ММ-ДД)\n"
+        "- Имя (ФИО дежурного)"
+    )
+    
+    await message.reply(help_text, reply_markup=get_admin_menu())
 
 @dp.message(F.document)
 async def handle_docs(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
-        await message.reply("❌ Только администраторы могут загружать файлы")
+        await message.reply("помидор")
         return
     
     doc = message.document
     fname = doc.file_name or 'uploaded.csv'
     
     if not any(fname.lower().endswith(ext) for ext in ('.csv', '.txt', '.xls', '.xlsx')):
-        await message.reply('❌ Пожалуйста, загрузите CSV или текстовый файл')
+        await message.reply('❌ Пожалуйста, загрузите CSV или текстовый файл', reply_markup=get_admin_menu())
         return
     
     await message.reply('📥 Файл получен, обработка...')
@@ -368,28 +530,50 @@ async def handle_docs(message: types.Message):
                 '❌ Не удалось распознать данные\n\n'
                 'Формат CSV должен содержать колонки:\n'
                 '- Дата (например: 01.02.2024 или 2024-02-01)\n'
-                '- Имя (ФИО дежурного)'
+                '- Имя (ФИО дежурного)',
+                reply_markup=get_admin_menu()
             )
             return
         
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute('DELETE FROM duties')
-        conn.commit()
-        conn.close()
-        
+        # Очищаем старые записи
+        clear_all_duties()
         insert_duties(records)
         
         # Показываем пример данных
-        sample = "\n".join([f"{r['date']}: {r['name']}" for r in records[:5]])
-        if len(records) > 5:
-            sample += f"\n... и еще {len(records) - 5} записей"
+        sample_text = f'✅ Импортировано {len(records)} записей\n\n'
         
-        await message.reply(f'✅ Импортировано {len(records)} записей\n\nПример:\n{sample}\n\nИспользуйте /send_today для проверки')
+        # Группируем первые 5 дат для примера
+        sample_records = records[:10]
+        grouped = {}
+        for record in sample_records:
+            date_str = record['date']
+            grouped.setdefault(date_str, []).append(record['name'])
+        
+        for date_str in sorted(grouped.keys())[:5]:  # Показываем максимум 5 дат
+            duty_date = datetime.fromisoformat(date_str).date()
+            names = grouped[date_str]
+            sample_text += f"<b>{duty_date.strftime('%d.%m.%Y')}:</b>\n"
+            sample_text += '\n'.join(f'• {n}' for n in names[:3])  # Показываем максимум 3 имени на дату
+            if len(names) > 3:
+                sample_text += f'\n... и еще {len(names) - 3} дежурных\n'
+            sample_text += "\n"
+        
+        if len(records) > 10:
+            sample_text += f"\n... и еще {len(records) - 10} записей\n"
+        
+        sample_text += "\nИспользуйте кнопку '📅 Дежурные сегодня' для проверки"
+        
+        await message.reply(sample_text, reply_markup=get_admin_menu())
         
     except Exception as e:
         logger.error(f"Ошибка обработки файла: {e}")
-        await message.reply('❌ Произошла ошибка при обработке файла')
+        await message.reply('❌ Произошла ошибка при обработке файла', reply_markup=get_admin_menu())
+
+# Обработка всех остальных сообщений от не-администраторов
+@dp.message()
+async def handle_non_admin_messages(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("помидор")
 
 # ========== ВЕБХУКИ И HTTP СЕРВЕР ==========
 async def handle_health(request):
