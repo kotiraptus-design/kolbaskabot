@@ -1,7 +1,6 @@
 """
 Telegram бот для ежедневной отправки дежурных из загружаемого Excel-списка.
-Только администраторы имеют доступ к функциям управления.
-Не-админам доступна только команда /start.
+Адаптировано для Render.com
 """
 
 import os
@@ -20,25 +19,32 @@ from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
 from apscheduler.triggers.cron import CronTrigger
-from dotenv import load_dotenv
 
-# Настройка логов
-logging.basicConfig(level=logging.INFO)
+# Настройка логов для Render
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 TIMEZONE = pytz.timezone("Europe/Moscow")
 
-# Загрузка конфигурации
-load_dotenv()
+# Загрузка конфигурации из переменных окружения Render
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_IDS = [int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()]
 DEFAULT_SEND_TIME = os.getenv('DEFAULT_SEND_TIME', '09:00')
-DATA_DIR = os.getenv('DATA_DIR', './data')
+
+# Для Render используем /tmp для временных файлов или текущую директорию
+if os.getenv('RENDER'):  # Если запущено на Render
+    DATA_DIR = os.getenv('DATA_DIR', '/tmp/data')
+else:
+    DATA_DIR = os.getenv('DATA_DIR', './data')
+
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, 'duty_bot.db')
 
 if not BOT_TOKEN:
-    raise RuntimeError('Установите BOT_TOKEN в .env')
+    raise RuntimeError('Установите BOT_TOKEN в переменных окружения Render')
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -50,7 +56,7 @@ def init_db():
     cur.execute('''
     CREATE TABLE IF NOT EXISTS duties (
         id INTEGER PRIMARY KEY,
-        duty_date TEXT NOT NULL, -- ISO YYYY-MM-DD
+        duty_date TEXT NOT NULL,
         name TEXT NOT NULL
     )
     ''')
@@ -67,6 +73,7 @@ def init_db():
     ''')
     conn.commit()
     conn.close()
+    logger.info(f"База данных инициализирована: {DB_PATH}")
 
 init_db()
 
@@ -130,26 +137,6 @@ def get_duties_for_date(d: date) -> List[str]:
     rows = cur.fetchall()
     conn.close()
     return [r[0] for r in rows]
-
-def get_duties_for_month(year: int, month: int) -> Dict[str, List[str]]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    start = date(year, month, 1).isoformat()
-    if month == 12:
-        end = date(year + 1, 1, 1).isoformat()
-    else:
-        end = date(year, month + 1, 1).isoformat()
-    cur.execute('''
-        SELECT duty_date, name FROM duties
-        WHERE duty_date >= ? AND duty_date < ?
-        ORDER BY duty_date
-    ''', (start, end))
-    rows = cur.fetchall()
-    conn.close()
-    result: Dict[str, List[str]] = {}
-    for d, name in rows:
-        result.setdefault(d, []).append(name)
-    return result
 
 # ========== ПАРСЕР EXCEL ==========
 DATE_HEADERS = ['дата', 'date', 'day', 'день']
@@ -262,13 +249,10 @@ def schedule_daily(send_time: str):
 
 # ========== МЕНЮ КОМАНД ==========
 async def set_bot_commands():
-    """Установка меню команд - разные команды для админов и не-админов"""
-    # Команды для ВСЕХ пользователей
-    all_commands = [
+    commands = [
         types.BotCommand(command="start", description="ℹ️ Информация о боте"),
     ]
     
-    # Команды только для АДМИНОВ
     admin_commands = [
         types.BotCommand(command="subscribe", description="📅 Добавить получателя"),
         types.BotCommand(command="unsubscribe", description="🚫 Удалить получателя"),
@@ -279,23 +263,20 @@ async def set_bot_commands():
         types.BotCommand(command="set_month", description="📆 Выбрать месяц"),
     ]
     
-    # Устанавливаем команды для всех пользователей
-    await bot.set_my_commands(all_commands)
+    await bot.set_my_commands(commands)
     
-    # Дополнительно устанавливаем все команды для админов
     for admin_id in ADMIN_IDS:
         try:
             await bot.set_my_commands(
-                all_commands + admin_commands,
+                commands + admin_commands,
                 scope=types.BotCommandScopeChat(chat_id=admin_id)
             )
         except Exception as e:
             logger.error(f"Не удалось установить команды для админа {admin_id}: {e}")
 
-# ========== КОМАНДА /START (ДЛЯ ВСЕХ) ==========
+# ========== КОМАНДА /START ==========
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    """Команда start доступна всем пользователям"""
     is_admin = message.from_user.id in ADMIN_IDS
     
     if is_admin:
@@ -313,7 +294,6 @@ async def cmd_start(message: types.Message):
             "<i>Просто отправьте Excel файл для обновления списка дежурных.</i>"
         )
     else:
-        # Обычный пользователь получает просто "помидор"
         welcome_text = "помидор"
     
     await message.reply(welcome_text)
@@ -321,7 +301,6 @@ async def cmd_start(message: types.Message):
 # ========== КОМАНДЫ ТОЛЬКО ДЛЯ АДМИНОВ ==========
 @dp.message(Command("subscribe"))
 async def cmd_subscribe(message: types.Message):
-    """Добавить чат в получатели - только для админов"""
     if message.from_user.id not in ADMIN_IDS:
         await message.reply("❌ Эта команда доступна только администраторам.")
         return
@@ -331,7 +310,6 @@ async def cmd_subscribe(message: types.Message):
 
 @dp.message(Command("unsubscribe"))
 async def cmd_unsubscribe(message: types.Message):
-    """Удалить чат из получателей - только для админов"""
     if message.from_user.id not in ADMIN_IDS:
         await message.reply("❌ Эта команда доступна только администраторам.")
         return
@@ -341,7 +319,6 @@ async def cmd_unsubscribe(message: types.Message):
 
 @dp.message(Command("set_time"))
 async def cmd_set_time(message: types.Message):
-    """Установить время рассылки - только для админов"""
     if message.from_user.id not in ADMIN_IDS:
         await message.reply("❌ Эта команда доступна только администраторам.")
         return
@@ -364,7 +341,6 @@ async def cmd_set_time(message: types.Message):
 
 @dp.message(Command("send_today"))
 async def cmd_send_today(message: types.Message):
-    """Отправить дежурных - только для админов"""
     if message.from_user.id not in ADMIN_IDS:
         await message.reply("❌ Эта команда доступна только администраторам.")
         return
@@ -374,7 +350,6 @@ async def cmd_send_today(message: types.Message):
 
 @dp.message(Command("set_month"))
 async def cmd_set_month(message: types.Message):
-    """Выбрать месяц - только для админов"""
     if message.from_user.id not in ADMIN_IDS:
         await message.reply("❌ Эта команда доступна только администраторам.")
         return
@@ -396,7 +371,6 @@ async def cmd_set_month(message: types.Message):
 
 @dp.message(Command("export"))
 async def cmd_export(message: types.Message):
-    """Экспорт данных - только для админов"""
     if message.from_user.id not in ADMIN_IDS:
         await message.reply("❌ Эта команда доступна только администраторам.")
         return
@@ -408,10 +382,9 @@ async def cmd_export(message: types.Message):
     df.to_excel(out_path, index=False)
     await message.reply_document(types.FSInputFile(out_path))
 
-# ========== ОБРАБОТКА ФАЙЛОВ (ТОЛЬКО ДЛЯ АДМИНОВ) ==========
+# ========== ОБРАБОТКА ФАЙЛОВ ==========
 @dp.message(F.document)
 async def handle_docs(message: types.Message):
-    """Загрузка Excel файлов - только для админов"""
     if message.from_user.id not in ADMIN_IDS:
         await message.reply('❌ Только администраторы могут загружать файлы.')
         return
@@ -441,38 +414,8 @@ async def handle_docs(message: types.Message):
         logger.exception('Ошибка при парсинге файла: %s', e)
         await message.reply('❌ Произошла ошибка при обработке файла.')
 
-# ========== ОБРАБОТКА ЛЮБЫХ ДРУГИХ СООБЩЕНИЙ ==========
-@dp.message()
-async def handle_other_messages(message: types.Message):
-    """Обработка любых других сообщений"""
-    if message.from_user.id not in ADMIN_IDS:
-        # Для не-админов просто игнорируем или отправляем подсказку
-        if message.text and message.text.startswith('/'):
-            await message.reply(
-                "❌ У вас нет доступа к этой команде.\n"
-                "Доступные команды:\n"
-                "• /start - Информация о боте\n\n"
-                "Для доступа к функциям управления обратитесь к администратору."
-            )
-        return
-    
-    # Для админов - отправляем подсказку
-    await message.reply(
-        "👑 <b>Команды администратора:</b>\n\n"
-        "• /start - Информация\n"
-        "• /subscribe - Добавить получателя\n"
-        "• /unsubscribe - Удалить получателя\n"
-        "• /send_today - Отправить дежурных\n"
-        "• /set_time HH:MM - Установить время\n"
-        "• /set_month YYYY-MM - Выбрать месяц\n"
-        "• /export - Экспорт данных\n"
-        "• Отправьте Excel файл - Загрузить данные\n\n"
-        "<i>Используйте команды или отправьте Excel файл</i>"
-    )
-
 # ========== ЗАПУСК БОТА ==========
 async def on_startup():
-    """Запуск при старте бота"""
     await set_bot_commands()
     
     send_time = get_config('send_time') or DEFAULT_SEND_TIME
@@ -482,12 +425,17 @@ async def on_startup():
         logger.exception('Не удалось запланировать задачу: %s', e)
     
     scheduler.start()
-    logger.info('Бот запущен')
+    logger.info('Бот запущен на Render')
 
 async def main():
-    """Главная функция"""
     await on_startup()
-    await dp.start_polling(bot)
+    
+    # Для Render важно держать приложение запущенным
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Ошибка при запуске бота: {e}")
 
 if __name__ == '__main__':
+    # Для Render нужно использовать asyncio.run()
     asyncio.run(main())
