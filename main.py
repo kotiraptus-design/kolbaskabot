@@ -439,3 +439,22 @@ async def main():
 if __name__ == '__main__':
     # Для Render нужно использовать asyncio.run()
     asyncio.run(main())
+
+from aiohttp import web
+
+# Health check для Render
+async def health_check(request):
+    return web.Response(text="OK")
+
+async def main():
+    # Создаем aiohttp приложение для health check
+    app = web.Application()
+    app.router.add_get('/health', health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+    
+    await on_startup()
+    await dp.start_polling(bot)
