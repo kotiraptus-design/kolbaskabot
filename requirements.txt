@@ -1,5 +1,4 @@
 aiogram==3.13.1
-openpyxl==3.1.2  # Только для записи Excel, если нужно
 apscheduler==3.10.4
 pytz==2024.1
-xlrd==2.0.1  # Для чтения старых .xls файлов
+aiohttp==3.9.1
